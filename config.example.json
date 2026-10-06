@@ -1,0 +1,11 @@
+{
+  "drag_threshold": 10,
+  "gap": 0,
+  "game_classes": [],
+  "zones": [
+    {"name": "maximize", "action": "maximize", "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0,
+     "trigger": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 0.06}},
+    {"name": "left half", "x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0},
+    {"name": "right half", "x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0}
+  ]
+}

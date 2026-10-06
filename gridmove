@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+"""GridMove for Cinnamon/X11.
+
+Hold the middle mouse button over a window, drag, and the drop zone under the
+pointer lights up on whichever monitor you're over. Release to snap the window
+into that zone. Cancel a drag with a left or right click before releasing
+(scroll-wheel nudges while pressing the wheel are ignored).
+
+The middle button belongs to GridMove alone: a plain middle click does nothing
+in any app, so there is no middle-click paste anywhere. Exceptions: middle
+clicks over a game (Proton/Wine/Steam window, or a class in "game_classes") go
+straight to the game, and gestures are ignored while the screen is locked.
+
+A zone with "action": "maximize" truly maximizes the window on that monitor.
+A zone's optional "trigger" is the part of the screen that selects it.
+
+Config:  ~/.config/gridmove/config.json  (re-read automatically when it changes;
+         an invalid file is rejected and the previous config kept)
+Logs:    journalctl -t gridmove            (GRIDMOVE_DEBUG=1 logs every event)
+"""
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import traceback
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_foreign("cairo")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+import cairo  # noqa: E402
+
+from Xlib import X, Xatom, display, error  # noqa: E402
+
+CONFIG_PATH = os.path.expanduser("~/.config/gridmove/config.json")
+
+DEFAULT_CONFIG = {
+    "drag_threshold": 10,
+    "gap": 0,
+    "game_classes": [],
+    "zones": [
+        {"name": "left half", "x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0},
+        {"name": "right half", "x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0},
+    ],
+}
+
+DEBUG = bool(os.environ.get("GRIDMOVE_DEBUG"))
+
+SKIP_TYPES = ("_NET_WM_WINDOW_TYPE_DESKTOP", "_NET_WM_WINDOW_TYPE_DOCK")
+RESTORE_STATES = ("_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ",
+                  "_NET_WM_STATE_FULLSCREEN")
+
+
+def log(msg):
+    print(f"gridmove: {msg}", file=sys.stderr, flush=True)
+
+
+def check_frac(spec, where):
+    for key in ("x", "y", "w", "h"):
+        v = spec.get(key)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 <= v <= 1:
+            raise ValueError(f"{where}.{key} must be a number from 0 to 1")
+    if spec["w"] <= 0 or spec["h"] <= 0:
+        raise ValueError(f"{where} has zero width or height")
+
+
+def validate(data):
+    for key in ("drag_threshold", "gap"):
+        v = data[key]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ValueError(f"{key} must be a whole number >= 0")
+    games = data["game_classes"]
+    if not isinstance(games, list) or not all(isinstance(g, str) for g in games):
+        raise ValueError("game_classes must be a list of strings")
+    zones = data["zones"]
+    if not isinstance(zones, list) or not zones:
+        raise ValueError("zones must be a non-empty list")
+    for i, z in enumerate(zones):
+        if not isinstance(z, dict):
+            raise ValueError(f"zones[{i}] must be an object")
+        check_frac(z, f"zones[{i}]")
+        if z.get("action", "place") not in ("place", "maximize"):
+            raise ValueError(f"zones[{i}].action must be \"place\" or \"maximize\"")
+        if "trigger" in z:
+            if not isinstance(z["trigger"], dict):
+                raise ValueError(f"zones[{i}].trigger must be an object")
+            check_frac(z["trigger"], f"zones[{i}].trigger")
+
+
+class Config:
+    def __init__(self):
+        self.mtime = None
+        self.data = dict(DEFAULT_CONFIG)
+
+    def refresh(self):
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH)
+        except OSError:
+            return
+        if mtime == self.mtime:
+            return
+        self.mtime = mtime
+        try:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
+                data = {**DEFAULT_CONFIG, **json.load(f)}
+            validate(data)
+        except (OSError, ValueError) as ex:
+            log(f"bad config, keeping previous: {ex}")
+            return
+        self.data = data
+        log(f"loaded config ({len(data['zones'])} zones)")
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+
+def frac_rect(area, spec):
+    """Fraction spec {x,y,w,h} -> absolute (x, y, w, h) inside area."""
+    ax, ay, aw, ah = area
+    x0 = ax + round(spec["x"] * aw)
+    y0 = ay + round(spec["y"] * ah)
+    x1 = ax + round((spec["x"] + spec["w"]) * aw)
+    y1 = ay + round((spec["y"] + spec["h"]) * ah)
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def contains(rect, px, py):
+    x, y, w, h = rect
+    return x <= px < x + w and y <= py < y + h
+
+
+class ScreenLock:
+    """Tracks whether cinnamon-screensaver is active (locked or blanked)."""
+
+    def __init__(self, on_change):
+        self.proxy = None
+        try:
+            self.proxy = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
+                "org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver",
+                "org.cinnamon.ScreenSaver", None)
+            self.proxy.connect("g-signal", self._on_signal, on_change)
+        except GLib.Error as ex:
+            log(f"no screensaver D-Bus ({ex.message}); lock detection off")
+
+    def _on_signal(self, _proxy, _sender, name, params, on_change):
+        if name == "ActiveChanged":
+            on_change(params.unpack()[0])
+
+    def active(self):
+        if self.proxy is None:
+            return False
+        try:
+            return bool(self.proxy.call_sync("GetActive", None, Gio.DBusCallFlags.NONE,
+                                             250, None).unpack()[0])
+        except GLib.Error:
+            return False  # screensaver not running, so nothing is locked
+
+
+class Overlay(Gtk.Window):
+    """Click-through, semi-transparent window covering one monitor's work area."""
+
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.POPUP)
+        self.set_app_paintable(True)
+        visual = self.get_screen().get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        self.area = (0, 0, 1, 1)
+        self.zones = []
+        self.triggers = []
+        self.active = None
+        self.connect("draw", self.on_draw)
+        self.connect("realize", lambda w: w.input_shape_combine_region(cairo.Region()))
+
+    def show_for(self, area, zones, triggers, active):
+        if area != self.area:
+            self.area = area
+            self.move(area[0], area[1])
+            self.resize(area[2], area[3])
+        self.zones = zones
+        self.triggers = triggers
+        self.active = active
+        self.show()
+        self.queue_draw()
+
+    def on_draw(self, _w, cr):
+        ax, ay = self.area[0], self.area[1]
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        for i, zone in enumerate(self.zones):
+            x, y, w, h = zone if i == self.active else self.triggers[i]
+            x, y = x - ax, y - ay
+            if i == self.active:
+                cr.set_source_rgba(0.20, 0.60, 0.90, 0.35)
+                cr.rectangle(x + 4, y + 4, w - 8, h - 8)
+                cr.fill()
+                cr.set_source_rgba(0.35, 0.75, 1.0, 0.95)
+                cr.set_line_width(4)
+            else:
+                cr.set_source_rgba(1, 1, 1, 0.35)
+                cr.set_line_width(2)
+            cr.rectangle(x + 4, y + 4, w - 8, h - 8)
+            cr.stroke()
+        return True
+
+
+class GridMove:
+    def __init__(self):
+        self.cfg = Config()
+        self.cfg.refresh()
+        self.d = display.Display()
+        self.root = self.d.screen().root
+        self.atom = lambda name: self.d.intern_atom(name)
+        self.overlay = Overlay()
+        self.gdk_display = Gdk.Display.get_default()
+        self.lock = ScreenLock(self.on_lock_changed)
+        self.reset()
+
+    # --- X setup -------------------------------------------------------------
+    def start(self):
+        # Sync mode: X freezes the pointer at each middle press until we call
+        # allow_events, so we can decide per press whether to handle it or replay
+        # it to the window underneath (games) as if we had never grabbed it.
+        catcher = error.CatchError(error.BadAccess)
+        self.root.grab_button(
+            2, X.AnyModifier, False,
+            X.ButtonPressMask | X.ButtonReleaseMask | X.PointerMotionMask,
+            X.GrabModeSync, X.GrabModeAsync, X.NONE, X.NONE,
+            onerror=catcher,
+        )
+        self.d.sync()
+        if catcher.get_error():
+            log("middle button is already grabbed by another program (xbindkeys?). Exiting.")
+            sys.exit(1)
+        GLib.io_add_watch(self.d.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, self.pump)
+        # python-xlib can buffer events while waiting on replies; sweep regularly.
+        GLib.timeout_add(100, self.pump)
+        log("running")
+
+    def pump(self, *_):
+        """Drain X events. Never raises: an exception escaping a GLib callback
+        would silently remove this source and leave middle clicks swallowed."""
+        try:
+            while self.d.pending_events():
+                e = self.d.next_event()
+                try:
+                    self.handle(e)
+                except Exception:
+                    log("error handling event, drag aborted:\n" + traceback.format_exc())
+                    self.abort()
+        except error.ConnectionClosedError:
+            log("X connection closed, exiting")
+            Gtk.main_quit()
+            return False
+        except Exception:
+            log("error reading events:\n" + traceback.format_exc())
+            self.abort()
+        return True
+
+    def abort(self):
+        self.reset()
+        try:
+            self.d.ungrab_pointer(X.CurrentTime)
+            self.d.flush()
+        except Exception:
+            pass
+
+    # --- window helpers ------------------------------------------------------
+    def window_at(self, px, py):
+        """Topmost managed window under the pointer, per the WM's stacking order.
+
+        Uses the WM's client list rather than the X child under the pointer, so
+        override-redirect windows (menus, tooltips, the lock screen) never count.
+        """
+        stack = self.root.get_full_property(self.atom("_NET_CLIENT_LIST_STACKING"), Xatom.WINDOW)
+        if not stack:
+            return None
+        desk = self.root.get_full_property(self.atom("_NET_CURRENT_DESKTOP"), Xatom.CARDINAL)
+        desk = desk.value[0] if desk else 0
+        hidden = self.atom("_NET_WM_STATE_HIDDEN")
+        for wid in reversed(stack.value):
+            win = self.d.create_resource_object("window", wid)
+            try:
+                if win.get_attributes().map_state != X.IsViewable:
+                    continue
+                if hidden in self.states(win):
+                    continue
+                wdesk = win.get_full_property(self.atom("_NET_WM_DESKTOP"), Xatom.CARDINAL)
+                if wdesk and wdesk.value[0] not in (desk, 0xFFFFFFFF):
+                    continue
+                geo = win.get_geometry()
+                pos = win.translate_coords(self.root, 0, 0)
+                x, y, w, h = -pos.x, -pos.y, geo.width, geo.height
+                l, r, t, b = self.extents(win, "_NET_FRAME_EXTENTS")
+                x, y, w, h = x - l, y - t, w + l + r, h + t + b
+                l, r, t, b = self.extents(win, "_GTK_FRAME_EXTENTS")
+                x, y, w, h = x + l, y + t, w - l - r, h - t - b
+                if contains((x, y, w, h), px, py):
+                    return win
+            except error.XError:
+                continue
+        return None
+
+    def game_name(self, win):
+        """WM_CLASS name if this looks like a game window, else None."""
+        names = [n for n in (win.get_wm_class() or ()) if n]
+        extra = {c.lower() for c in self.cfg["game_classes"]}
+        for n in names:
+            low = n.lower()
+            if low.endswith(".exe") or low.startswith("steam_app_") or low in extra:
+                return n
+        # Every Wine/Proton window carries _WINE_HWND; Steam tags its games STEAM_GAME.
+        for marker in ("_WINE_HWND", "STEAM_GAME"):
+            atom = self.d.get_atom(marker, only_if_exists=True)
+            if atom and win.get_full_property(atom, X.AnyPropertyType):
+                return names[0] if names else marker
+        return None
+
+    def states(self, win):
+        prop = win.get_full_property(self.atom("_NET_WM_STATE"), Xatom.ATOM)
+        return list(prop.value) if prop else []
+
+    def window_types(self, win):
+        prop = win.get_full_property(self.atom("_NET_WM_WINDOW_TYPE"), Xatom.ATOM)
+        return [self.d.get_atom_name(a) for a in prop.value] if prop else []
+
+    def extents(self, win, name):
+        prop = win.get_full_property(self.atom(name), Xatom.CARDINAL)
+        if prop and len(prop.value) == 4:
+            return [int(v) for v in prop.value]  # left, right, top, bottom
+        return [0, 0, 0, 0]
+
+    def needs_restore(self, win):
+        restore = {self.atom(s) for s in RESTORE_STATES}
+        return any(a in restore for a in self.states(win))
+
+    # --- snapping ------------------------------------------------------------
+    def snap(self, win, rect, maximize=False):
+        wid = f"0x{win.id:08x}"
+        if not self.needs_restore(win):
+            self.place(win, rect, maximize)
+            return
+        # wmctrl takes at most two states per call.
+        subprocess.run(["wmctrl", "-ir", wid, "-b", "remove,maximized_vert,maximized_horz"],
+                       check=False)
+        subprocess.run(["wmctrl", "-ir", wid, "-b", "remove,fullscreen"], check=False)
+        # Frame/shadow extents change once the window is restored, so wait for the
+        # WM to drop the state, then give the client a moment to update its extents.
+        tries = {"left": 15}
+
+        def wait():
+            try:
+                tries["left"] -= 1
+                if self.needs_restore(win) and tries["left"] > 0:
+                    return True
+                GLib.timeout_add(60, lambda: self.place_safe(win, rect, maximize))
+            except Exception:
+                log("restore wait failed:\n" + traceback.format_exc())
+            return False
+
+        GLib.timeout_add(40, wait)
+
+    def place_safe(self, win, rect, maximize=False):
+        try:
+            self.place(win, rect, maximize)
+        except Exception:
+            log("placement failed:\n" + traceback.format_exc())
+        return False
+
+    def place(self, win, rect, maximize=False):
+        x, y, w, h = rect
+        l, r, t, b = self.extents(win, "_NET_FRAME_EXTENTS")
+        if any((l, r, t, b)):
+            # Server-side decorations: x,y is the frame corner, w,h the client size.
+            w, h = w - l - r, h - t - b
+        else:
+            # Client-side decorations: client includes invisible shadow margins.
+            l, r, t, b = self.extents(win, "_GTK_FRAME_EXTENTS")
+            x, y, w, h = x - l, y - t, w + l + r, h + t + b
+        wid = f"0x{win.id:08x}"
+        log(f"snap {wid} -> {rect} (wmctrl {x},{y},{w},{h})")
+        # Gravity 1 (NorthWest): x,y always mean the frame's top-left corner.
+        subprocess.run(["wmctrl", "-ir", wid, "-e", f"1,{x},{y},{max(w, 50)},{max(h, 50)}"],
+                       check=False)
+        if maximize:
+            # Move onto the target monitor first; the WM maximizes on the monitor
+            # the window is on.
+            GLib.timeout_add(80, self.maximize, wid)
+        subprocess.run(["wmctrl", "-ia", wid], check=False)
+
+    def maximize(self, wid):
+        log(f"maximize {wid}")
+        subprocess.run(["wmctrl", "-ir", wid, "-b", "add,maximized_vert,maximized_horz"],
+                       check=False)
+        return False
+
+    # --- zone geometry -------------------------------------------------------
+    def zones_at(self, px, py):
+        """Returns (workarea, [zone rects], [trigger rects], index under pointer or None)."""
+        mon = self.gdk_display.get_monitor_at_point(px, py)
+        wa = mon.get_workarea()
+        area = (wa.x, wa.y, wa.width, wa.height)
+        gap = self.cfg["gap"]
+        rects, triggers, active = [], [], None
+        for i, z in enumerate(self.cfg["zones"]):
+            zx, zy, zw, zh = frac_rect(area, z)
+            g = 0 if z.get("action") == "maximize" else gap
+            rects.append((zx + g, zy + g, zw - 2 * g, zh - 2 * g))
+            trigger = frac_rect(area, z["trigger"]) if "trigger" in z else (zx, zy, zw, zh)
+            triggers.append(trigger)
+            if active is None and contains(trigger, px, py):
+                active = i
+        return area, rects, triggers, active
+
+    # --- event handling ------------------------------------------------------
+    def reset(self):
+        self.pressed = False
+        self.dragging = False
+        self.target = None
+        self.start_pos = (0, 0)
+        self.overlay.hide()
+
+    def on_lock_changed(self, active):
+        if active and self.pressed:
+            log("screen locked, drag cancelled")
+            self.abort()
+
+    def handle(self, e):
+        if DEBUG:
+            log(f"event type={e.type} detail={getattr(e, 'detail', '-')} "
+                f"pos=({getattr(e, 'root_x', '-')},{getattr(e, 'root_y', '-')})")
+        if e.type == X.ButtonPress:
+            if e.detail == 2:
+                self.reset()
+                replay = False
+                try:
+                    replay = self.on_press(e)
+                finally:
+                    # Always unfreeze the pointer, whatever happened above.
+                    self.d.allow_events(X.ReplayPointer if replay else X.AsyncPointer, e.time)
+                    self.d.flush()
+                if replay:
+                    self.reset()
+            elif self.pressed and e.detail in (1, 3):
+                log(f"drag cancelled (button {e.detail})")
+                self.reset()
+            elif self.pressed and DEBUG:
+                log(f"ignored button {e.detail} during drag (scroll wheel)")
+        elif e.type == X.MotionNotify and self.pressed:
+            self.on_motion(e.root_x, e.root_y)
+        elif e.type == X.ButtonRelease and e.detail == 2 and self.pressed:
+            self.on_release(e.root_x, e.root_y)
+
+    def on_press(self, e):
+        """Returns True to hand this press to the window under the pointer."""
+        self.cfg.refresh()
+        self.pressed = True
+        self.start_pos = (e.root_x, e.root_y)
+        self.target = None
+        if self.lock.active():
+            if DEBUG:
+                log("press ignored: screen locked")
+            return False
+        win = self.window_at(e.root_x, e.root_y)
+        if win and not any(t in SKIP_TYPES for t in self.window_types(win)):
+            game = self.game_name(win)
+            if game:
+                log(f"middle press passed to game ({game})")
+                return True
+            self.target = win
+        if DEBUG:
+            log(f"press target={hex(self.target.id) if self.target else None}")
+        return False
+
+    def on_motion(self, px, py):
+        if self.target is None:
+            return
+        if not self.dragging:
+            sx, sy = self.start_pos
+            thr = self.cfg["drag_threshold"]
+            if abs(px - sx) < thr and abs(py - sy) < thr:
+                return
+            self.dragging = True
+        area, rects, triggers, active = self.zones_at(px, py)
+        self.overlay.show_for(area, rects, triggers, active)
+
+    def on_release(self, px, py):
+        self.on_motion(px, py)  # the release position decides, not the last motion
+        target, dragging = self.target, self.dragging
+        self.reset()
+        if not (dragging and target is not None):
+            return  # plain middle click: deliberately does nothing
+        _area, rects, _triggers, active = self.zones_at(px, py)
+        if active is not None:
+            zone = self.cfg["zones"][active]
+            self.snap(target, rects[active], zone.get("action") == "maximize")
+
+
+def single_instance():
+    run_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    lock = open(os.path.join(run_dir, "gridmove.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("already running")
+        sys.exit(0)
+    return lock
+
+
+def main():
+    _lock = single_instance()
+    app = GridMove()
+    app.start()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, Gtk.main_quit)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
