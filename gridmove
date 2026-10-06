@@ -137,27 +137,36 @@ class ScreenLock:
 
     def __init__(self, on_change):
         self.proxy = None
+        self.locked = False
         try:
             self.proxy = Gio.DBusProxy.new_for_bus_sync(
                 Gio.BusType.SESSION, Gio.DBusProxyFlags.DO_NOT_LOAD_PROPERTIES, None,
                 "org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver",
                 "org.cinnamon.ScreenSaver", None)
             self.proxy.connect("g-signal", self._on_signal, on_change)
+            self.locked = self.query()
         except GLib.Error as ex:
             log(f"no screensaver D-Bus ({ex.message}); lock detection off")
 
     def _on_signal(self, _proxy, _sender, name, params, on_change):
         if name == "ActiveChanged":
-            on_change(params.unpack()[0])
+            self.locked = bool(params.unpack()[0])
+            on_change(self.locked)
 
-    def active(self):
-        if self.proxy is None:
-            return False
+    def query(self):
         try:
             return bool(self.proxy.call_sync("GetActive", None, Gio.DBusCallFlags.NONE,
                                              250, None).unpack()[0])
         except GLib.Error:
             return False  # screensaver not running, so nothing is locked
+
+    def active(self):
+        """Cached state from ActiveChanged, so a press normally costs no D-Bus call.
+        A cached "locked" is re-checked, so a missed unlock can't disable GridMove."""
+        if self.proxy is None or not self.locked:
+            return False
+        self.locked = self.query()
+        return self.locked
 
 
 class Overlay(Gtk.Window):
@@ -220,6 +229,7 @@ class GridMove:
         self.overlay = Overlay()
         self.gdk_display = Gdk.Display.get_default()
         self.lock = ScreenLock(self.on_lock_changed)
+        self.ops = {}  # window id -> generation of its latest snap
         self.reset()
 
     # --- X setup -------------------------------------------------------------
@@ -341,39 +351,57 @@ class GridMove:
         return any(a in restore for a in self.states(win))
 
     # --- snapping ------------------------------------------------------------
+    def wmctrl(self, *args):
+        """Run wmctrl with a time limit, so a stuck wmctrl can't block the main
+        loop (a middle press arriving then would leave the pointer frozen)."""
+        try:
+            subprocess.run(["wmctrl", *args], check=False, timeout=1)
+        except subprocess.TimeoutExpired:
+            log(f"wmctrl {' '.join(args)} timed out")
+
+    def later(self, ms, win, gen, fn):
+        """Run fn after ms unless a newer snap of the same window has started."""
+        def run():
+            if self.ops.get(win.id) != gen:
+                return False
+            try:
+                return fn()
+            except Exception:
+                log("delayed snap step failed:\n" + traceback.format_exc())
+                return False
+        GLib.timeout_add(ms, run)
+
     def snap(self, win, rect, maximize=False):
+        gen = self.ops.get(win.id, 0) + 1
+        self.ops[win.id] = gen
         wid = f"0x{win.id:08x}"
         if not self.needs_restore(win):
-            self.place(win, rect, maximize)
+            self.place(win, rect, gen, maximize)
             return
         # wmctrl takes at most two states per call.
-        subprocess.run(["wmctrl", "-ir", wid, "-b", "remove,maximized_vert,maximized_horz"],
-                       check=False)
-        subprocess.run(["wmctrl", "-ir", wid, "-b", "remove,fullscreen"], check=False)
+        self.wmctrl("-ir", wid, "-b", "remove,maximized_vert,maximized_horz")
+        self.wmctrl("-ir", wid, "-b", "remove,fullscreen")
         # Frame/shadow extents change once the window is restored, so wait for the
         # WM to drop the state, then give the client a moment to update its extents.
         tries = {"left": 15}
 
         def wait():
-            try:
-                tries["left"] -= 1
-                if self.needs_restore(win) and tries["left"] > 0:
-                    return True
-                GLib.timeout_add(60, lambda: self.place_safe(win, rect, maximize))
-            except Exception:
-                log("restore wait failed:\n" + traceback.format_exc())
+            tries["left"] -= 1
+            if self.needs_restore(win) and tries["left"] > 0:
+                return True
+            self.later(60, win, gen, lambda: self.place(win, rect, gen, maximize))
             return False
 
-        GLib.timeout_add(40, wait)
+        self.later(40, win, gen, wait)
 
-    def place_safe(self, win, rect, maximize=False):
-        try:
-            self.place(win, rect, maximize)
-        except Exception:
-            log("placement failed:\n" + traceback.format_exc())
-        return False
+    def visible_origin(self, win):
+        """Top-left of what you see: the WM frame, minus any CSD shadow margin."""
+        pos = win.translate_coords(self.root, 0, 0)
+        fl, _r, ft, _b = self.extents(win, "_NET_FRAME_EXTENTS")
+        gl, _r, gt, _b = self.extents(win, "_GTK_FRAME_EXTENTS")
+        return -pos.x - fl + gl, -pos.y - ft + gt
 
-    def place(self, win, rect, maximize=False):
+    def place(self, win, rect, gen, maximize=False):
         x, y, w, h = rect
         l, r, t, b = self.extents(win, "_NET_FRAME_EXTENTS")
         if any((l, r, t, b)):
@@ -386,19 +414,26 @@ class GridMove:
         wid = f"0x{win.id:08x}"
         log(f"snap {wid} -> {rect} (wmctrl {x},{y},{w},{h})")
         # Gravity 1 (NorthWest): x,y always mean the frame's top-left corner.
-        subprocess.run(["wmctrl", "-ir", wid, "-e", f"1,{x},{y},{max(w, 50)},{max(h, 50)}"],
-                       check=False)
+        self.wmctrl("-ir", wid, "-e", f"1,{x},{y},{max(w, 50)},{max(h, 50)}")
+        self.wmctrl("-ia", wid)
         if maximize:
-            # Move onto the target monitor first; the WM maximizes on the monitor
-            # the window is on.
-            GLib.timeout_add(80, self.maximize, wid)
-        subprocess.run(["wmctrl", "-ia", wid], check=False)
+            # The WM maximizes on the monitor the window is on, so wait until the
+            # move has landed on the target monitor (up to ~1s), then maximize.
+            tries = {"left": 25}
 
-    def maximize(self, wid):
-        log(f"maximize {wid}")
-        subprocess.run(["wmctrl", "-ir", wid, "-b", "add,maximized_vert,maximized_horz"],
-                       check=False)
-        return False
+            def wait():
+                tries["left"] -= 1
+                fx, fy = self.visible_origin(win)
+                arrived = contains(rect, fx + 1, fy + 1)
+                if not arrived and tries["left"] > 0:
+                    return True
+                if not arrived:
+                    log(f"{wid} hadn't reached the target monitor; maximizing anyway")
+                log(f"maximize {wid}")
+                self.wmctrl("-ir", wid, "-b", "add,maximized_vert,maximized_horz")
+                return False
+
+            self.later(40, win, gen, wait)
 
     # --- zone geometry -------------------------------------------------------
     def zones_at(self, px, py):
