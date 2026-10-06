@@ -1,6 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=GridMove
-Comment=Middle-drag windows into snap zones
-Exec=/usr/bin/systemd-cat -t gridmove /home/zim/bin/gridmove
-X-GNOME-Autostart-enabled=true

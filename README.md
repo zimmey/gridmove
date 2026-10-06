@@ -2,6 +2,10 @@
 
 A GridMove-style window snapper for Linux Mint Cinnamon on X11.
 
+Inspired by [GridMove](https://www.dcmembers.com/jgpaiva/) by jgpaiva, the
+original drag-to-grid window manager for Windows. This is an independent
+reimplementation for Linux and shares no code with it.
+
 Hold the middle mouse button over a window and drag. The drop zone under the
 pointer lights up on whichever monitor you're over. Let go and the window snaps
 into that zone.
@@ -18,24 +22,37 @@ into that zone.
 - **Lock screen:** drags are ignored while the screen is locked.
 - **Cancel** a drag with a left or right click before letting go.
 
-## Files
+## Install
 
-| In this repo | Live location |
-|---|---|
-| `gridmove` | `~/bin/gridmove` (a symlink to this file) |
-| `config.example.json` | `~/.config/gridmove/config.json` (re-read automatically when it changes) |
-| `gridmove.desktop` | `~/.config/autostart/gridmove.desktop` (starts it at login) |
+```sh
+git clone https://github.com/zimmey/gridmove.git
+cd gridmove
+./install.sh
+```
 
-Requires `python3-xlib`, PyGObject (GTK 3) and `wmctrl`. Nothing else may grab
-the middle button. xbindkeys must stay off.
+The installer checks dependencies (it prints the `apt install` line if any are
+missing), links `~/.local/bin/gridmove` to the repo copy so a `git pull`
+updates it, installs `~/.config/gridmove/config.json` if you don't have one,
+adds a login autostart entry, and starts GridMove.
+
+- `./install.sh --no-start` installs without starting.
+- `./install.sh --uninstall` stops GridMove and removes the link and autostart
+  entry. Your config stays.
+- `BIN_DIR=~/bin ./install.sh` puts the link somewhere other than `~/.local/bin`.
+
+Requires an X11 session, `python3-xlib`, PyGObject with GTK 3 and cairo, and
+`wmctrl`. Nothing else may grab the middle button. If xbindkeys has a `b:2`
+binding, the installer warns you, and you'll need to remove that binding.
+
+Middle-click paste stays off for as long as GridMove is running.
 
 ## Running
 
 ```sh
 journalctl -t gridmove -f                    # log, one line per snap
 pkill -f 'bin/gridmove$'                     # stop
-setsid -f systemd-cat -t gridmove ~/bin/gridmove    # start
-GRIDMOVE_DEBUG=1 ~/bin/gridmove              # run in the foreground, log every event
+./install.sh                                 # (re)start
+GRIDMOVE_DEBUG=1 ~/.local/bin/gridmove       # run in the foreground, log every event
 ```
 
 If the mouse ever freezes, the keyboard still works: alt-tab to a terminal and
@@ -60,3 +77,7 @@ run `pkill -f 'bin/gridmove$'`.
 Zone values are fractions of the monitor's work area. `trigger` is the part of
 the screen that selects a zone (it defaults to the zone itself). The first
 matching zone wins. An invalid file is rejected and the previous config kept.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
