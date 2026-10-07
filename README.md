@@ -74,9 +74,11 @@ run `pkill -f 'bin/gridmove$'`.
 }
 ```
 
-Zone values are fractions of the monitor's work area. `trigger` is the part of
-the screen that selects a zone (it defaults to the zone itself). The first
-matching zone wins. An invalid file is rejected and the previous config kept.
+The config lives in `~/.config/gridmove/config.json` (or under
+`$XDG_CONFIG_HOME` if you've set it). Zone values are fractions of the
+monitor's work area. `trigger` is the part of the screen that selects a zone
+(it defaults to the zone itself). The first matching zone wins. An invalid file
+is rejected and the previous config kept.
 
 ## License
 

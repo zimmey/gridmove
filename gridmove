@@ -14,7 +14,8 @@ straight to the game, and gestures are ignored while the screen is locked.
 A zone with "action": "maximize" truly maximizes the window on that monitor.
 A zone's optional "trigger" is the part of the screen that selects it.
 
-Config:  ~/.config/gridmove/config.json  (re-read automatically when it changes;
+Config:  $XDG_CONFIG_HOME/gridmove/config.json, normally ~/.config/gridmove/
+         config.json  (re-read automatically when it changes;
          an invalid file is rejected and the previous config kept)
 Logs:    journalctl -t gridmove            (GRIDMOVE_DEBUG=1 logs every event)
 """
@@ -35,7 +36,8 @@ import cairo  # noqa: E402
 
 from Xlib import X, Xatom, display, error  # noqa: E402
 
-CONFIG_PATH = os.path.expanduser("~/.config/gridmove/config.json")
+CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "gridmove", "config.json")
 
 DEFAULT_CONFIG = {
     "drag_threshold": 10,
