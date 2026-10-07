@@ -323,19 +323,31 @@ class GridMove:
         return None
 
     def game_name(self, win):
-        """WM_CLASS name if this looks like a game window, else None."""
+        """WM_CLASS name if this looks like a game window, else None.
+
+        Strong markers (Steam's game tag, steam_app_*/steam_proton classes, or a
+        class in game_classes) always mean a game. Weak markers (any Wine window:
+        _WINE_HWND or an .exe class) only count when the window is full screen or
+        has no title bar, so ordinary Wine apps like SQLyog can still be snapped.
+        """
         names = [n for n in (win.get_wm_class() or ()) if n]
+        label = names[0] if names else "?"
         extra = {c.lower() for c in self.cfg["game_classes"]}
         for n in names:
             low = n.lower()
-            if low.endswith(".exe") or low.startswith("steam_app_") or low in extra:
+            if low.startswith(("steam_app_", "steam_proton")) or low in extra:
                 return n
-        # Every Wine/Proton window carries _WINE_HWND; Steam tags its games STEAM_GAME.
-        for marker in ("_WINE_HWND", "STEAM_GAME"):
-            atom = self.d.get_atom(marker, only_if_exists=True)
-            if atom and win.get_full_property(atom, X.AnyPropertyType):
-                return names[0] if names else marker
+        if self.has_prop(win, "STEAM_GAME"):
+            return label
+        wine = self.has_prop(win, "_WINE_HWND") or any(n.lower().endswith(".exe") for n in names)
+        if wine and (self.atom("_NET_WM_STATE_FULLSCREEN") in self.states(win)
+                     or not any(self.extents(win, "_NET_FRAME_EXTENTS"))):
+            return label
         return None
+
+    def has_prop(self, win, name):
+        atom = self.d.get_atom(name, only_if_exists=True)
+        return bool(atom and win.get_full_property(atom, X.AnyPropertyType))
 
     def states(self, win):
         prop = win.get_full_property(self.atom("_NET_WM_STATE"), Xatom.ATOM)

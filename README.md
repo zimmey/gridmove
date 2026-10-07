@@ -15,10 +15,11 @@ into that zone.
   monitor.
 - **Middle click is GridMove's alone.** A plain middle click does nothing in any
   app, so there's no middle-click paste anywhere.
-- **Games are left alone.** Windows with a Wine/Proton marker (`_WINE_HWND`), a
-  Steam marker (`STEAM_GAME`, class `steam_app_*`), a class ending in `.exe`, or
-  a class listed in `game_classes` are never moved. Middle clicks over them go
-  straight to the game.
+- **Games are left alone.** Steam games (the `STEAM_GAME` tag or a
+  `steam_app_*`/`steam_proton` class) and any class listed in `game_classes`
+  are never moved. Other Wine windows (`_WINE_HWND` or an `.exe` class) count
+  as games only when they're full screen or have no title bar, so ordinary
+  Wine apps still snap. Middle clicks over a game go straight to the game.
 - **Lock screen:** drags are ignored while the screen is locked.
 - **Cancel** a drag with a left or right click before letting go.
 
