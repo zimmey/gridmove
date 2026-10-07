@@ -226,7 +226,10 @@ class GridMove:
         self.d = display.Display()
         self.root = self.d.screen().root
         self.atom = lambda name: self.d.intern_atom(name)
-        self.overlay = Overlay()
+        # One overlay per monitor work area, created once and never moved: with a
+        # full-screen game unredirected, Muffin can keep painting a moved
+        # override-redirect window at its old position.
+        self.overlays = {}
         self.gdk_display = Gdk.Display.get_default()
         self.lock = ScreenLock(self.on_lock_changed)
         self.ops = {}  # window id -> generation of its latest snap
@@ -459,7 +462,8 @@ class GridMove:
         self.dragging = False
         self.target = None
         self.start_pos = (0, 0)
-        self.overlay.hide()
+        for overlay in self.overlays.values():
+            overlay.hide()
 
     def on_lock_changed(self, active):
         if active and self.pressed:
@@ -523,7 +527,12 @@ class GridMove:
                 return
             self.dragging = True
         area, rects, triggers, active = self.zones_at(px, py)
-        self.overlay.show_for(area, rects, triggers, active)
+        for other_area, overlay in self.overlays.items():
+            if other_area != area:
+                overlay.hide()
+        if area not in self.overlays:
+            self.overlays[area] = Overlay()
+        self.overlays[area].show_for(area, rects, triggers, active)
 
     def on_release(self, px, py):
         self.on_motion(px, py)  # the release position decides, not the last motion
